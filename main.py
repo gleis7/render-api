@@ -1,70 +1,105 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 import pandas as pd
 import akshare as ak
 import efinance as ef
+from pytdx.hq import TdxHq_API
+import json
 
-app = FastAPI(title="统一金融数据 API - 华为云版")
+app = FastAPI(title="金融数据网关 - 自动防封锁版")
 
-# ==========================================
-# 0. 系统级路由 (用于保活与健康检查)
-# ==========================================
 @app.get("/ping")
-@app.post("/invoke") # 兼容华为云内部定时触发器的 POST 请求
-async def keep_alive():
-    return {"status": "alive", "message": "Container is warm."}
+def keep_alive():
+    return {"status": "alive"}
 
 # ==========================================
-# 1. EFinance 接口 - 主攻【实时/高频微观】
+# 辅助函数 1：用通达信获取数据 (底层 TCP，抗封锁)
 # ==========================================
-@app.get("/api/realtime/quote/{code}")
-def get_efinance_quote(code: str):
-    try:
-        # 获取股票实时行情 (支持 A股、美股、港股，例如 "600519")
-        df = ef.stock.get_quote_history(code)
-        if df.empty:
-            raise HTTPException(status_code=404, detail="未获取到数据")
+def fetch_from_tdx(code: str, count: int):
+    api = TdxHq_API(heartbeat=True)
+    # 通达信常用行情服务器 IP (深圳节点之一，对海外连通率高)
+    ip, port = '119.147.212.81', 7709 
+    
+    with api.connect(ip, port):
+        # 市场代码判断: 上海(6开头)为1，深圳(0或3开头)为0
+        market = 1 if code.startswith('6') else 0
+        # 获取日线数据: category 9 为日线
+        data = api.get_security_bars(9, market, code, 0, count)
+        if not data:
+            raise Exception("通达信未返回数据")
         
-        # 转换数据格式，处理 NaN 空值
+        df = api.to_df(data)
+        # 统一格式：截取前10位日期，保留核心列
+        df['date'] = df['datetime'].str.slice(0, 10)
+        df.rename(columns={'vol': 'volume'}, inplace=True)
+        return df[['date', 'open', 'close', 'high', 'low', 'volume']]
+
+# ==========================================
+# 辅助函数 2：用 efinance 获取数据
+# ==========================================
+def fetch_from_efinance(code: str):
+    df = ef.stock.get_quote_history(code)
+    if df.empty:
+        raise Exception("EFinance未返回数据")
+    # 统一字段名
+    df.rename(columns={
+        '日期': 'date', '开盘': 'open', '收盘': 'close', 
+        '最高': 'high', '最低': 'low', '成交量': 'volume'
+    }, inplace=True)
+    return df[['date', 'open', 'close', 'high', 'low', 'volume']]
+
+# ==========================================
+# 辅助函数 3：用 akshare 获取数据
+# ==========================================
+def fetch_from_akshare(code: str):
+    # 只取近期数据防止 OOM
+    df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date="20230101", adjust="qfq")
+    if df.empty:
+        raise Exception("AkShare未返回数据")
+    # 统一字段名
+    df.rename(columns={
+        '日期': 'date', '开盘': 'open', '收盘': 'close', 
+        '最高': 'high', '最低': 'low', '成交量': 'volume'
+    }, inplace=True)
+    return df[['date', 'open', 'close', 'high', 'low', 'volume']]
+
+
+# ==========================================
+# 核心路由：全自动智能切换获取 K 线数据
+# ==========================================
+@app.get("/api/smart_history/{code}")
+def get_smart_history(code: str, count: int = 100):
+    """
+    智能获取数据：按照 PyTDX -> EFinance -> AkShare 的顺序尝试，
+    哪个成功就返回哪个，彻底解决单个数据源被封锁的问题。
+    """
+    errors = []
+    
+    # 第一优先级：通达信 (TCP长连接，极少被封海外IP)
+    try:
+        df = fetch_from_tdx(code, count)
+        data = df.fillna("").to_dict(orient="records")
+        return {"code": 0, "source": "pytdx", "data": data}
+    except Exception as e:
+        errors.append(f"PyTDX 失败: {str(e)}")
+
+    # 第二优先级：EFinance
+    try:
+        df = fetch_from_efinance(code)
+        # efinance 返回全量数据，按 count 截取最后几行
+        df = df.tail(count) 
         data = df.fillna("").to_dict(orient="records")
         return {"code": 0, "source": "efinance", "data": data}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        errors.append(f"EFinance 失败: {str(e)}")
 
-# ==========================================
-# 2. AkShare 接口 - 主攻【历史/宏观】
-# ==========================================
-@app.get("/api/akshare/history/{code}")
-def get_akshare_history(code: str, start_date: str = "20230101", end_date: str = "20231231"):
+    # 第三优先级：AkShare
     try:
-        # 获取 A 股前复权历史 K 线
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-        if df.empty:
-            raise HTTPException(status_code=404, detail="未获取到数据")
-        
-        # 处理日期格式并转换为 JSON 安全格式
-        if '日期' in df.columns:
-            df['日期'] = df['日期'].astype(str)
-            
+        df = fetch_from_akshare(code)
+        df = df.tail(count)
         data = df.fillna("").to_dict(orient="records")
         return {"code": 0, "source": "akshare", "data": data}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ==========================================
-# 3. 巨潮资讯 (CNInfo) - 借由 AkShare 调用
-# ==========================================
-@app.get("/api/cninfo/announcement/{code}")
-def get_cninfo_announcement(code: str):
-    try:
-        # 调取巨潮资讯的个股公告摘要（示例接口）
-        # 注意：此处以深交所/巨潮数据为例，根据实际需求可替换 akshare 中的其他巨潮接口
-        df = ak.stock_info_szse_cninfo(symbol="最新公告") 
+        errors.append(f"AkShare 失败: {str(e)}")
         
-        # 为了演示，此处过滤出请求的代码（实际使用中建议研究 AkShare 文档获取最匹配接口）
-        if not df.empty and '代码' in df.columns:
-            df = df[df['代码'] == code]
-            
-        data = df.fillna("").to_dict(orient="records")
-        return {"code": 0, "source": "cninfo", "data": data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # 如果三个全挂了，抛出 500 详细报错
+    raise HTTPException(status_code=500, detail="所有数据源均不可用。日志: " + " | ".join(errors))
